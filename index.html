@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DXF Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #2c2c2c;
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 24px;
+      gap: 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      max-width: 1123px;
+    }
+
+    .toolbar h1 {
+      font-size: 16px;
+      color: #ccc;
+      font-weight: normal;
+      flex: 1;
+    }
+
+    #fileLabel {
+      cursor: pointer;
+      background: #0078d4;
+      color: #fff;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 4px;
+      font-size: 14px;
+      transition: background 0.2s;
+    }
+    #fileLabel:hover { background: #005fa3; }
+
+    #fileInput { display: none; }
+
+    #fileName {
+      color: #aaa;
+      font-size: 13px;
+    }
+
+    #resetBtn {
+      cursor: pointer;
+      background: #444;
+      color: #ccc;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 4px;
+      font-size: 13px;
+      display: none;
+    }
+    #resetBtn:hover { background: #555; }
+
+    /* A4 landscape: 297mm × 210mm → at 96 dpi ≈ 1122.5 × 793.7 px */
+    .a4-wrapper {
+      width: 1123px;
+      height: 794px;
+      background: #fff;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.6);
+      position: relative;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 1123px;
+      height: 794px;
+    }
+
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: #bbb;
+      pointer-events: none;
+    }
+    .placeholder svg { opacity: 0.3; }
+    .placeholder p { font-size: 14px; }
+
+    #info {
+      color: #888;
+      font-size: 12px;
+      align-self: flex-start;
+      margin-left: calc((100% - 1123px) / 2);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <h1>DXF Viewer &mdash; A4 Landscape</h1>
+    <span id="fileName">No file loaded</span>
+    <button id="resetBtn" onclick="resetView()">Reset view</button>
+    <label id="fileLabel" for="fileInput">&#8593; Import DXF</label>
+    <input type="file" id="fileInput" accept=".dxf" />
+  </div>
+
+  <div class="a4-wrapper" id="a4Wrapper">
+    <canvas id="canvas" width="1123" height="794"></canvas>
+    <div class="placeholder" id="placeholder">
+      <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.5">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="9" y1="13" x2="15" y2="13"/>
+        <line x1="9" y1="17" x2="13" y2="17"/>
+      </svg>
+      <p>Import a .dxf file to view it here</p>
+    </div>
+  </div>
+
+  <div id="info"></div>
+
+  <script src="node_modules/dxf-parser/dist/dxf-parser.js"></script>
+  <script>
+    const canvas  = document.getElementById('canvas');
+    const ctx     = canvas.getContext('2d');
+    const W = canvas.width;   // 1123
+    const H = canvas.height;  // 794
+
+    const PADDING = 40; // px margin inside the A4 sheet
+
+    // ── pan / zoom state ──────────────────────────────────────────────────────
+    let transform = { x: 0, y: 0, scale: 1 };
+    let isPanning = false, panStart = null;
+
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('mousedown', e => {
+      isPanning = true;
+      panStart = { x: e.clientX - transform.x, y: e.clientY - transform.y };
+      canvas.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mousemove', e => {
+      if (!isPanning) return;
+      transform.x = e.clientX - panStart.x;
+      transform.y = e.clientY - panStart.y;
+      redraw();
+    });
+    window.addEventListener('mouseup', () => {
+      isPanning = false;
+      canvas.style.cursor = 'default';
+    });
+
+    function onWheel(e) {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const factor = e.deltaY < 0 ? 1.1 : 0.9;
+      transform.x = mx - (mx - transform.x) * factor;
+      transform.y = my - (my - transform.y) * factor;
+      transform.scale *= factor;
+      redraw();
+    }
+
+    function resetView() {
+      if (currentEntities) fitToCanvas(currentEntities);
+    }
+
+    // ── DXF state ─────────────────────────────────────────────────────────────
+    let currentEntities = null;
+
+    document.getElementById('fileInput').addEventListener('change', function () {
+      const file = this.files[0];
+      if (!file) return;
+      document.getElementById('fileName').textContent = file.name;
+      const reader = new FileReader();
+      reader.onload = e => loadDxf(e.target.result);
+      reader.readAsText(file);
+    });
+
+    function loadDxf(text) {
+      let dxf;
+      try {
+        // UMD bundle exposes window.DxfParser = { DxfParser: Class }
+        const Parser = DxfParser.DxfParser || DxfParser;
+        dxf = new Parser().parseSync(text);
+      } catch (err) {
+        alert('Failed to parse DXF file:\n' + err.message);
+        return;
+      }
+
+      const entities = extractEntities(dxf);
+      currentEntities = entities;
+      document.getElementById('placeholder').style.display = 'none';
+      document.getElementById('resetBtn').style.display = '';
+
+      const counts = `Lines: ${entities.lines.length}  |  Polylines: ${entities.polylines.length}  |  LWPolylines: ${entities.lwpolylines.length}  |  Inserts: ${entities.inserts.length}  |  Arcs: ${entities.arcs.length}  |  Circles: ${entities.circles.length}`;
+      document.getElementById('info').textContent = counts;
+
+      fitToCanvas(entities);
+    }
+
+    // ── entity extraction ─────────────────────────────────────────────────────
+    function extractEntities(dxf) {
+      const result = { lines: [], polylines: [], lwpolylines: [], inserts: [], arcs: [], circles: [] };
+      for (const e of dxf.entities || []) {
+        switch (e.type) {
+          case 'LINE':       result.lines.push(e);       break;
+          case 'POLYLINE':   result.polylines.push(e);   break;
+          case 'LWPOLYLINE': result.lwpolylines.push(e); break;
+          case 'INSERT':     result.inserts.push(e);     break;
+          case 'ARC':        result.arcs.push(e);        break;
+          case 'CIRCLE':     result.circles.push(e);     break;
+        }
+      }
+      return result;
+    }
+
+    // ── bounding box ──────────────────────────────────────────────────────────
+    function getBounds(entities) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+      function pt(x, y) {
+        if (x == null || y == null || isNaN(x) || isNaN(y)) return;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+
+      for (const e of entities.lines) {
+        for (const v of e.vertices || []) pt(v.x, v.y);
+      }
+      for (const e of entities.polylines) {
+        for (const v of e.vertices || []) pt(v.x, v.y);
+      }
+      for (const e of entities.lwpolylines) {
+        for (const v of e.vertices || []) pt(v.x, v.y);
+      }
+      for (const e of entities.inserts) {
+        if (e.position) pt(e.position.x, e.position.y);
+      }
+      for (const e of entities.arcs) {
+        if (e.center) {
+          pt(e.center.x - e.radius, e.center.y - e.radius);
+          pt(e.center.x + e.radius, e.center.y + e.radius);
+        }
+      }
+      for (const e of entities.circles) {
+        if (e.center) {
+          pt(e.center.x - e.radius, e.center.y - e.radius);
+          pt(e.center.x + e.radius, e.center.y + e.radius);
+        }
+      }
+
+      if (!isFinite(minX)) return null;
+      return { minX, minY, maxX, maxY };
+    }
+
+    // ── fit & transform ───────────────────────────────────────────────────────
+    function fitToCanvas(entities) {
+      const bounds = getBounds(entities);
+      if (!bounds) return;
+
+      const dxfW = bounds.maxX - bounds.minX || 1;
+      const dxfH = bounds.maxY - bounds.minY || 1;
+      const drawW = W - PADDING * 2;
+      const drawH = H - PADDING * 2;
+      const scale = Math.min(drawW / dxfW, drawH / dxfH);
+
+      // center within the canvas (DXF Y flips to screen Y)
+      const cx = PADDING + (drawW - dxfW * scale) / 2;
+      const cy = PADDING + (drawH - dxfH * scale) / 2;
+
+      transform = {
+        scale,
+        x: cx - bounds.minX * scale,
+        y: cy + bounds.maxY * scale, // flip Y
+        flipY: true,
+        minX: bounds.minX,
+        maxY: bounds.maxY,
+      };
+
+      redraw();
+    }
+
+    // ── coordinate helpers ────────────────────────────────────────────────────
+    function sx(x) { return transform.x + x * transform.scale; }
+    function sy(y) { return transform.y - y * transform.scale; } // Y flip
+
+    // ── draw ──────────────────────────────────────────────────────────────────
+    function redraw() {
+      ctx.clearRect(0, 0, W, H);
+      if (!currentEntities) return;
+
+      ctx.save();
+      ctx.strokeStyle = '#222';
+      ctx.lineWidth = Math.max(0.3, 1 / transform.scale);
+
+      drawLines(currentEntities.lines);
+      drawPolylines(currentEntities.polylines);
+      drawLWPolylines(currentEntities.lwpolylines);
+      drawArcs(currentEntities.arcs);
+      drawCircles(currentEntities.circles);
+      drawInserts(currentEntities.inserts);
+
+      ctx.restore();
+    }
+
+    function drawLines(lines) {
+      for (const e of lines) {
+        const [s, end] = e.vertices || [];
+        if (!s || !end) continue;
+        ctx.beginPath();
+        ctx.moveTo(sx(s.x), sy(s.y));
+        ctx.lineTo(sx(end.x), sy(end.y));
+        ctx.stroke();
+      }
+    }
+
+    function drawPolylines(polylines) {
+      for (const e of polylines) {
+        const verts = e.vertices || [];
+        if (verts.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(sx(verts[0].x), sy(verts[0].y));
+        for (let i = 1; i < verts.length; i++) ctx.lineTo(sx(verts[i].x), sy(verts[i].y));
+        if (e.shape) ctx.closePath();
+        ctx.stroke();
+      }
+    }
+
+    function drawLWPolylines(polylines) {
+      for (const e of polylines) {
+        const verts = e.vertices || [];
+        if (verts.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(sx(verts[0].x), sy(verts[0].y));
+        for (let i = 1; i < verts.length; i++) ctx.lineTo(sx(verts[i].x), sy(verts[i].y));
+        if (e.shape) ctx.closePath();
+        ctx.stroke();
+      }
+    }
+
+    function drawArcs(arcs) {
+      for (const e of arcs) {
+        if (!e.center) continue;
+        const r = e.radius * transform.scale;
+        // DXF angles are CCW from +X; canvas is CW, Y flipped → negate angles
+        ctx.beginPath();
+        ctx.arc(
+          sx(e.center.x), sy(e.center.y), r,
+          -e.endAngle, -e.startAngle,
+          false
+        );
+        ctx.stroke();
+      }
+    }
+
+    function drawCircles(circles) {
+      for (const e of circles) {
+        if (!e.center) continue;
+        const r = e.radius * transform.scale;
+        ctx.beginPath();
+        ctx.arc(sx(e.center.x), sy(e.center.y), r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    function drawInserts(inserts) {
+      // Mark insert positions with a small cross
+      const cs = 5; // cross half-size in px
+      ctx.strokeStyle = '#e05';
+      for (const e of inserts) {
+        if (!e.position) continue;
+        const px = sx(e.position.x), py = sy(e.position.y);
+        ctx.beginPath();
+        ctx.moveTo(px - cs, py); ctx.lineTo(px + cs, py);
+        ctx.moveTo(px, py - cs); ctx.lineTo(px, py + cs);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = '#222';
+    }
+  </script>
+</body>
+</html>
